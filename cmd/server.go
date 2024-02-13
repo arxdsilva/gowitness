@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/sensepost/gowitness/chrome"
 	"github.com/sensepost/gowitness/lib"
 	"github.com/sensepost/gowitness/storage"
@@ -720,14 +721,14 @@ func apiScreenshotHandler(c *gin.Context) {
 }
 
 type manager struct {
-	worker worker
+	consumer consumer
 }
 
 func NewManager() manager {
-	worker := New()
-	go worker.Start()
+	consumer := new()
+	go consumer.Start()
 	return manager{
-		worker: worker,
+		consumer: consumer,
 	}
 }
 
@@ -756,37 +757,39 @@ func (m *manager) postURLsHandler(c *gin.Context) {
 	log.Printf("[postURLsHandler] req %+v\n", len(req.URLs))
 
 	for _, url := range req.URLs {
-		m.worker.receiver <- url
+		m.consumer.receiver <- url
 	}
 
 	log.Println("[postURLsHandler] sent to processing")
 	c.JSON(http.StatusOK, req)
 }
 
-type worker struct {
+type consumer struct {
 	window   *chrome.Chrome
 	lock     *sync.Mutex
 	receiver chan string
 }
 
-func New() worker {
-	return worker{
+func new() consumer {
+	return consumer{
 		window:   chrome.NewChrome(),
 		receiver: make(chan string, 10),
 		lock:     &sync.Mutex{},
 	}
 }
 
-func (w *worker) Start() {
-	i := 0
+func (w *consumer) Start() {
 	for url := range w.receiver {
-		go w.work(url, i)
-		i++
+		// this is sequential even if you use "go w.work(url, i)"
+		// because of the lock, should be fine for now
+		// if you want to parallelize, we should use a pool of workers
+		// receiving the urls and chrome instances
+		w.work(url)
 	}
-	fmt.Println("[worker] done")
+	fmt.Println("[consumer] done")
 }
 
-func (w *worker) work(uri string, i int) {
+func (w *consumer) work(uri string) {
 	start := time.Now()
 	w.lock.Lock()
 	defer w.lock.Unlock()
@@ -798,19 +801,8 @@ func (w *worker) work(uri string, i int) {
 		return
 	}
 
-	ii := strconv.Itoa(i)
-	name := u.String()
-	if len(name) > 40 {
-		name = name[:40] + ii + ".png"
-	}
-	fn := lib.SafeFileName(name)
+	fn := lib.SafeFileName(genName())
 	fp := lib.ScreenshotPath(fn, u, options.ScreenshotPath)
-
-	preflight, err := chrm.Preflight(u)
-	if err != nil {
-		log.Println("[work][chrm.Preflight] error", err)
-		return
-	}
 
 	result, err := chrm.Screenshot(u)
 	if err != nil {
@@ -820,7 +812,7 @@ func (w *worker) work(uri string, i int) {
 
 	var rid uint
 	if rsDB != nil {
-		if rid, err = chrm.StoreRequest(rsDB, preflight, result, fn); err != nil {
+		if rid, err = chrm.StoreReq(rsDB, result, fn); err != nil {
 			log.Println("[work][chrm.StoreRequest] error", err)
 			return
 		}
@@ -832,4 +824,8 @@ func (w *worker) work(uri string, i int) {
 	}
 
 	log.Println("[work] time spent", time.Since(start), rid)
+}
+
+func genName() string {
+	return uuid.New().String() + ".png"
 }

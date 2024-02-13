@@ -15,8 +15,6 @@ import (
 
 	"github.com/chromedp/cdproto/inspector"
 	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/sensepost/gowitness/storage"
 	"gorm.io/gorm"
@@ -290,62 +288,8 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 		return nil, err
 	}
 
-	// prevent browser crashes from locking the context (prevents hanging)
-	chromedp.ListenTarget(browserCtx, func(ev interface{}) {
-		if _, ok := ev.(*inspector.EventTargetCrashed); ok {
-			cancelBrowserCtx()
-		}
-	})
-
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		if _, ok := ev.(*inspector.EventTargetCrashed); ok {
-			cancelTabCtx()
-		}
-	})
-
-	// squash JavaScript dialog boxes such as alert();
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		if _, ok := ev.(*page.EventJavascriptDialogOpening); ok {
-			go func() {
-				if err := chromedp.Run(tabCtx,
-					page.HandleJavaScriptDialog(true),
-				); err != nil {
-					cancelTabCtx()
-				}
-			}()
-		}
-	})
-
-	// log console.* events, as well as any thrown exceptions
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		switch ev := ev.(type) {
-		case *runtime.EventConsoleAPICalled:
-
-			// use a buffer to read each arg passed to the console.* call
-			buf := ""
-			for _, arg := range ev.Args {
-				buf += string(arg.Value)
-			}
-
-			result.ConsoleLog = append(result.ConsoleLog, ConsoleLog{
-				Type:  "console." + string(ev.Type),
-				Value: buf,
-			})
-
-		case *runtime.EventExceptionThrown:
-			result.ConsoleLog = append(result.ConsoleLog, ConsoleLog{
-				Type:  "exception",
-				Value: ev.ExceptionDetails.Error(),
-			})
-		}
-	})
-
-	// keep a keyed reference so we can map network logs to requestid's and
-	// update them as responses are received
-	networkLog := make(map[string]NetworkLog)
-
-	// i := 0
 	var reqID network.RequestID
+
 	// log network events
 	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
 		switch ev := ev.(type) {
@@ -355,62 +299,16 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 			if sameURL {
 				reqID = ev.RequestID
 			}
-			// fmt.Println("RequestWillBeSent", i, sameURL)
-			// i++
-			// record a fresh request that will be sent
-			networkLog[string(ev.RequestID)] = NetworkLog{
-				RequestID:   string(ev.RequestID),
-				Time:        time.Time(*ev.Timestamp),
-				RequestType: storage.HTTP,
-				URL:         ev.Request.URL,
-			}
-		case *network.EventResponseReceived:
-			// update the networkLog map with updated information about response
-			if entry, ok := networkLog[string(ev.RequestID)]; ok {
-				entry.StatusCode = ev.Response.Status
-				entry.FinalURL = ev.Response.URL
-				entry.IP = ev.Response.RemoteIPAddress
-
-				networkLog[string(ev.RequestID)] = entry
-			}
-		case *network.EventLoadingFailed:
-			// update the network map with the error experienced
-			if entry, ok := networkLog[string(ev.RequestID)]; ok {
-				entry.Error = ev.ErrorText
-
-				networkLog[string(ev.RequestID)] = entry
-			}
-		// websockets
-		case *network.EventWebSocketCreated:
-			networkLog[string(ev.RequestID)] = NetworkLog{
-				RequestID:   string(ev.RequestID),
-				RequestType: storage.WS,
-				URL:         ev.URL,
-			}
-		case *network.EventWebSocketHandshakeResponseReceived:
-			if entry, ok := networkLog[string(ev.RequestID)]; ok {
-				entry.StatusCode = ev.Response.Status
-				entry.Time = time.Time(*ev.Timestamp)
-
-				networkLog[string(ev.RequestID)] = entry
-			}
-		case *network.EventWebSocketFrameError:
-			if entry, ok := networkLog[string(ev.RequestID)]; ok {
-				entry.Error = ev.ErrorMessage
-
-				networkLog[string(ev.RequestID)] = entry
-			}
 		}
 	})
 
 	// perform navigation on the tab context and attempt to take a clean screenshot
-	err = chromedp.Run(tabCtx, buildTasks(chrome, url, true, &result.Screenshot, &result.DOM))
+	err = chromedp.Run(tabCtx,
+		buildTasks(chrome, url, true, &result.Screenshot, &result.DOM))
 
 	fmt.Println("Error1", err)
-	// fmt.Println("DOM", result.DOM)
 	if errors.Is(err, context.DeadlineExceeded) {
 		buf, _ := network.GetResponseBody(reqID).Do(tabCtx)
-		// fmt.Println("buf", buf)
 
 		result.Screenshot = buf
 
@@ -435,21 +333,16 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 		// attempt to capture the screenshot of the tab and replace error accordingly
 		err = chromedp.Run(newTabCtx, buildTasks(
 			chrome, url, false, &result.Screenshot, &result.DOM))
-		// err = nil
+
 		fmt.Println("Error2", err)
 	}
 
-	// if err != nil {
-	// 	return nil, err
-	// }
+	if err != nil {
+		return nil, err
+	}
 
 	// close the tab so that we dont receive more network events
 	cancelTabCtx()
-
-	// append the networklog
-	for _, log := range networkLog {
-		result.NetworkLog = append(result.NetworkLog, log)
-	}
 
 	return result, nil
 }
@@ -459,45 +352,22 @@ func buildTasks(chrome *Chrome, url *url.URL, doNavigate bool, buf *[]byte, dom 
 	var actions chromedp.Tasks
 
 	if len(chrome.HeadersMap) > 0 {
-		actions = append(actions, network.Enable(), network.SetExtraHTTPHeaders(network.Headers(chrome.HeadersMap)))
+		actions = append(actions,
+			network.Enable(),
+			network.SetExtraHTTPHeaders(network.Headers(chrome.HeadersMap)))
 	}
 
 	if doNavigate {
 		actions = append(actions, chromedp.Navigate(url.String()))
-		if len(chrome.JsCode) > 0 {
-			actions = append(actions, chromedp.Evaluate(chrome.JsCode, nil))
-		}
-		if chrome.Delay > 0 {
-			actions = append(actions, chromedp.Sleep(time.Duration(chrome.Delay)*time.Second))
-		}
 		actions = append(actions, chromedp.Stop())
 	}
 
 	// add a small sleep to wait for images and other things
-	actions = append(actions, chromedp.Sleep(time.Second*3))
+	actions = append(actions, chromedp.Sleep(time.Millisecond*500))
 
 	// grab the dom
 	actions = append(actions, chromedp.OuterHTML(":root", dom, chromedp.ByQueryAll))
-
-	// should we print as pdf?
-	if chrome.AsPDF {
-		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-			var err error
-			*buf, _, err = page.PrintToPDF().
-				WithDisplayHeaderFooter(true).
-				Do(ctx)
-			return err
-		}))
-
-		return actions
-	}
-
-	// otherwise screenshot as png
-	if chrome.FullPage {
-		actions = append(actions, chromedp.FullScreenshot(buf, 100))
-	} else {
-		actions = append(actions, chromedp.CaptureScreenshot(buf))
-	}
+	actions = append(actions, chromedp.CaptureScreenshot(buf))
 
 	return actions
 }
@@ -524,4 +394,23 @@ func (chrome *Chrome) PrepareHeaderMap() {
 			chrome.HeadersMap[headerSlice[0]] = headerSlice[1]
 		}
 	}
+}
+
+// StoreRequest will store request info to the DB
+// remove prefliht
+func (chrome *Chrome) StoreReq(db *gorm.DB, screenshot *ScreenshotResult, filename string) (uint, error) {
+
+	record := &storage.URL{
+		DOM:      screenshot.DOM,
+		Filename: filename,
+		IsPDF:    chrome.AsPDF,
+	}
+
+	// if screenshots need to be saved to the database, do that.
+	if chrome.ScreenshotDbStore {
+		record.Screenshot = base64.StdEncoding.EncodeToString(screenshot.Screenshot)
+	}
+
+	db.Create(record)
+	return record.ID, nil
 }

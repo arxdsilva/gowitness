@@ -7,6 +7,7 @@ require (
 	github.com/chromedp/chromedp v0.9.3
 	github.com/corona10/goimagehash v1.1.0
 	github.com/gin-gonic/gin v1.9.1
+	github.com/google/uuid v1.6.0
 	github.com/h2non/filetype v1.1.3
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/projectdiscovery/wappalyzergo v0.0.109
