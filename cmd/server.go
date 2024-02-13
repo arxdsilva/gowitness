@@ -1,16 +1,22 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/sensepost/gowitness/chrome"
 	"github.com/sensepost/gowitness/lib"
 	"github.com/sensepost/gowitness/storage"
 	"github.com/spf13/cobra"
@@ -101,6 +107,8 @@ $ gowitness server --address 127.0.0.1:9000 --allow-insecure-uri`,
 		tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(Embedded, "web/ui-templates/*.html"))
 		r.SetHTMLTemplate(tmpl)
 
+		mngr := NewManager()
+
 		// web ui routes
 		r.GET("/", dashboardHandler)
 		r.GET("/gallery", galleryHandler)
@@ -110,6 +118,7 @@ $ gowitness server --address 127.0.0.1:9000 --allow-insecure-uri`,
 		r.GET("/submit", getSubmitHandler)
 		r.POST("/submit", submitHandler)
 		r.POST("/search", searchHandler)
+		r.POST("/posturls", mngr.postURLsHandler)
 
 		// static assets & raw screenshot files
 		assetFs, err := fs.Sub(Embedded, "web/assets")
@@ -708,4 +717,119 @@ func apiScreenshotHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"status": "created",
 	})
+}
+
+type manager struct {
+	worker worker
+}
+
+func NewManager() manager {
+	worker := New()
+	go worker.Start()
+	return manager{
+		worker: worker,
+	}
+}
+
+type Request struct {
+	URLs []string `json:"urls" binding:"required"`
+}
+
+// postURLsHandler handles new requests
+func (m *manager) postURLsHandler(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+	req := &Request{}
+	if err := json.Unmarshal(body, req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+	log.Printf("[postURLsHandler] req %+v\n", len(req.URLs))
+
+	for _, url := range req.URLs {
+		m.worker.receiver <- url
+	}
+
+	log.Println("[postURLsHandler] sent to processing")
+	c.JSON(http.StatusOK, req)
+}
+
+type worker struct {
+	window   *chrome.Chrome
+	lock     *sync.Mutex
+	receiver chan string
+}
+
+func New() worker {
+	return worker{
+		window:   chrome.NewChrome(),
+		receiver: make(chan string, 10),
+		lock:     &sync.Mutex{},
+	}
+}
+
+func (w *worker) Start() {
+	i := 0
+	for url := range w.receiver {
+		go w.work(url, i)
+		i++
+	}
+	fmt.Println("[worker] done")
+}
+
+func (w *worker) work(uri string, i int) {
+	start := time.Now()
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	log.Println("[work] uri", uri)
+
+	u, err := url.Parse(uri)
+	if err != nil {
+		log.Println("[work][url.Parse] error ", err)
+		return
+	}
+
+	ii := strconv.Itoa(i)
+	name := u.String()
+	if len(name) > 40 {
+		name = name[:40] + ii + ".png"
+	}
+	fn := lib.SafeFileName(name)
+	fp := lib.ScreenshotPath(fn, u, options.ScreenshotPath)
+
+	preflight, err := chrm.Preflight(u)
+	if err != nil {
+		log.Println("[work][chrm.Preflight] error", err)
+		return
+	}
+
+	result, err := chrm.Screenshot(u)
+	if err != nil {
+		log.Println("[work] error", err)
+		return
+	}
+
+	var rid uint
+	if rsDB != nil {
+		if rid, err = chrm.StoreRequest(rsDB, preflight, result, fn); err != nil {
+			log.Println("[work][chrm.StoreRequest] error", err)
+			return
+		}
+	}
+
+	if err := os.WriteFile(fp, result.Screenshot, 0644); err != nil {
+		log.Println("[work][os.WriteFile] error", err)
+		return
+	}
+
+	log.Println("[work] time spent", time.Since(start), rid)
 }

@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -120,6 +122,7 @@ func (chrome *Chrome) Preflight(url *url.URL) (result *PreflightResult, err erro
 
 	req, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
+		log.Println("[error] 1", err)
 		return
 	}
 	req.Header.Set("User-Agent", chrome.UserAgent)
@@ -131,18 +134,21 @@ func (chrome *Chrome) Preflight(url *url.URL) (result *PreflightResult, err erro
 
 	req.Close = true
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(chrome.Timeout)*time.Second)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), time.Duration(chrome.Timeout)*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Println("[error] 2", err)
 		return
 	}
 
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Println("[error] 3", err)
 		return
 	}
 
@@ -338,11 +344,19 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 	// update them as responses are received
 	networkLog := make(map[string]NetworkLog)
 
+	// i := 0
+	var reqID network.RequestID
 	// log network events
 	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
 		switch ev := ev.(type) {
 		// http
 		case *network.EventRequestWillBeSent:
+			sameURL := ev.Request.URL == url.String()
+			if sameURL {
+				reqID = ev.RequestID
+			}
+			// fmt.Println("RequestWillBeSent", i, sameURL)
+			// i++
 			// record a fresh request that will be sent
 			networkLog[string(ev.RequestID)] = NetworkLog{
 				RequestID:   string(ev.RequestID),
@@ -392,7 +406,14 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 	// perform navigation on the tab context and attempt to take a clean screenshot
 	err = chromedp.Run(tabCtx, buildTasks(chrome, url, true, &result.Screenshot, &result.DOM))
 
+	fmt.Println("Error1", err)
+	// fmt.Println("DOM", result.DOM)
 	if errors.Is(err, context.DeadlineExceeded) {
+		buf, _ := network.GetResponseBody(reqID).Do(tabCtx)
+		// fmt.Println("buf", buf)
+
+		result.Screenshot = buf
+
 		// if the context timeout exceeded (e.g. on a long page load) then
 		// just take the screenshot this will take a screenshot of whatever
 		// loaded before failing
@@ -400,7 +421,8 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 		// create a new tab context for this scenario, since our previous
 		// context expired using a context timeout delay again to help
 		// prevent hanging scenarios
-		newTabCtx, cancelNewTabCtx := context.WithTimeout(browserCtx, time.Duration(chrome.Timeout)*time.Second)
+		newTabCtx, cancelNewTabCtx := context.WithTimeout(browserCtx,
+			time.Duration(chrome.Timeout)*time.Second)
 		defer cancelNewTabCtx()
 
 		// listen for crashes on this backup context as well
@@ -411,12 +433,15 @@ func (chrome *Chrome) Screenshot(url *url.URL) (result *ScreenshotResult, err er
 		})
 
 		// attempt to capture the screenshot of the tab and replace error accordingly
-		err = chromedp.Run(newTabCtx, buildTasks(chrome, url, false, &result.Screenshot, &result.DOM))
+		err = chromedp.Run(newTabCtx, buildTasks(
+			chrome, url, false, &result.Screenshot, &result.DOM))
+		// err = nil
+		fmt.Println("Error2", err)
 	}
 
-	if err != nil {
-		return nil, err
-	}
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	// close the tab so that we dont receive more network events
 	cancelTabCtx()
